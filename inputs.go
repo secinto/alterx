@@ -43,58 +43,85 @@ func (i *Input) GetMap() map[string]interface{} {
 	return m
 }
 
-// NewInput parses URL to Input Vars
+// NewInput parses a URL or domain string into structured Input variables.
+// It extracts TLD, eTLD, SLD, root domain, subdomains, and multi-level components.
 func NewInput(inputURL string) (*Input, error) {
 	URL, err := urlutil.Parse(inputURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse URL: %w", err)
 	}
-	// check if hostname contains *
-	if strings.Contains(URL.Hostname(), "*") {
-		if strings.HasPrefix(URL.Hostname(), "*.") {
-			tmp := strings.TrimPrefix(URL.Hostname(), "*.")
-			URL.Host = strings.Replace(URL.Host, URL.Hostname(), tmp, 1)
+
+	hostname := URL.Hostname()
+	if hostname == "" {
+		return nil, fmt.Errorf("empty hostname in URL")
+	}
+
+	// Handle wildcard domains
+	if strings.Contains(hostname, "*") {
+		if strings.HasPrefix(hostname, "*.") {
+			// Remove leading wildcard (e.g., *.example.com -> example.com)
+			hostname = strings.TrimPrefix(hostname, "*.")
+			URL.Host = strings.Replace(URL.Host, URL.Hostname(), hostname, 1)
 		}
-		// if * is present in middle ex: prod.*.hackerone.com
-		// skip it
-		if strings.Contains(URL.Hostname(), "*") {
-			return nil, fmt.Errorf("input %v is not a valid url , skipping", inputURL)
+		// If * is present in middle (e.g., prod.*.hackerone.com), reject it
+		if strings.Contains(hostname, "*") {
+			return nil, fmt.Errorf("wildcard in middle of domain not supported: %s", inputURL)
 		}
 	}
+
 	ivar := &Input{}
-	suffix, _ := publicsuffix.PublicSuffix(URL.Hostname())
+
+	// Extract public suffix (TLD or eTLD like .com or .co.uk)
+	suffix, err := publicsuffix.PublicSuffix(hostname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract public suffix: %w", err)
+	}
+
 	if strings.Contains(suffix, ".") {
+		// Multi-part TLD like co.uk
 		ivar.ETLD = suffix
-		arr := strings.Split(suffix, ".")
-		ivar.TLD = arr[len(arr)-1]
+		parts := strings.Split(suffix, ".")
+		ivar.TLD = parts[len(parts)-1]
 	} else {
+		// Simple TLD like .com
 		ivar.TLD = suffix
 	}
-	rootDomain, err := publicsuffix.EffectiveTLDPlusOne(URL.Hostname())
+
+	// Extract root domain (eTLD+1)
+	rootDomain, err := publicsuffix.EffectiveTLDPlusOne(hostname)
 	if err != nil {
-		// this happens if input domain does not have eTLD+1 at all ex: `.com` or `co.uk`
-		gologger.Warning().Msgf("input domain %v is eTLD/publicsuffix and not a valid domain name", URL.Hostname())
-		return ivar, nil
+		// This happens if input is just a TLD (e.g., ".com" or "co.uk")
+		return nil, fmt.Errorf("domain '%s' appears to be a public suffix without a registered domain", hostname)
 	}
+
 	ivar.Root = rootDomain
+
+	// Extract second-level domain (SLD)
 	if ivar.ETLD != "" {
 		ivar.SLD = strings.TrimSuffix(rootDomain, "."+ivar.ETLD)
 	} else {
 		ivar.SLD = strings.TrimSuffix(rootDomain, "."+ivar.TLD)
 	}
-	// anything before root domain is subdomain
-	subdomainPrefix := strings.TrimSuffix(URL.Hostname(), rootDomain)
+
+	// Extract subdomain components
+	subdomainPrefix := strings.TrimSuffix(hostname, rootDomain)
 	subdomainPrefix = strings.TrimSuffix(subdomainPrefix, ".")
+
 	if strings.Contains(subdomainPrefix, ".") {
-		// this is a multi level subdomain
-		// ex: something.level.scanme.sh
-		// in such cases variable name starts after 1st prefix
+		// Multi-level subdomain (e.g., api.v1.example.com -> sub=api, sub1=v1)
 		prefixes := strings.Split(subdomainPrefix, ".")
 		ivar.Sub = prefixes[0]
 		ivar.MultiLevel = prefixes[1:]
 	} else {
 		ivar.Sub = subdomainPrefix
 	}
-	ivar.Suffix = strings.TrimPrefix(URL.Hostname(), ivar.Sub+".")
+
+	// Suffix is everything except the leftmost subdomain
+	if ivar.Sub != "" {
+		ivar.Suffix = strings.TrimPrefix(hostname, ivar.Sub+".")
+	} else {
+		ivar.Suffix = hostname
+	}
+
 	return ivar, nil
 }

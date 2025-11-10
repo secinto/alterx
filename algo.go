@@ -1,82 +1,90 @@
 package alterx
 
-// Nth Order ClusterBomb with variable length array/values
-func ClusterBomb(payloads *IndexMap, callback func(varMap map[string]interface{}), Vector []string) {
-	// The Goal of implementation is to reduce number of arbitary values by constructing a vector
-
-	// Algorithm
-	// step 1) Initialize/Input a IndexMap(Here: payloads)
-	// indexMap is nothing but a map with all of keys indexed in a different map
-
-	// step 2) Vector is n length array such that n = len(payloads)
-	// Each value in payloads(IndexMap) contains a array
-	// ex: payloads["word"] = []string{"api","dev","cloud"}
-
-	// step 3) Initial length of Vector is 0 . By using recursion
-	// we construct a Vector with all possible values of payloads[N] where N = 0 < len(payloads)
-
-	// step 4) At end of recursion len(Vector) == len(payloads).Cap() - 1
-	// which translates that Vn = {r0,r1,...,rn} and only rn is missing
-	// in this case/situation iterate over all possible values of rn i.e payload.GetNth(n)
+// ClusterBomb generates all combinations of payloads using an Nth-order ClusterBomb algorithm.
+// It uses recursion to construct permutations efficiently while avoiding stack overflows.
+//
+// The callback function receives each generated permutation as a map and should return true
+// to continue processing or false to stop early (useful for cancellation).
+//
+// Algorithm Overview:
+//  1. Initialize an IndexMap containing all payloads with indexed keys
+//  2. Build a Vector of length n where n = len(payloads)
+//  3. Use recursion to construct all possible combinations
+//  4. At the final recursion level, iterate through remaining values and invoke callback
+//
+// Example:
+//
+//	Given payloads["word"] = []string{"api", "dev", "cloud"}
+//	and payloads["env"] = []string{"prod", "staging"}
+//	This generates: api-prod, api-staging, dev-prod, dev-staging, cloud-prod, cloud-staging
+func ClusterBomb(payloads *IndexMap, callback func(varMap map[string]interface{}) bool, Vector []string) bool {
+	// Base case: Vector is complete except for the last element
 	if len(Vector) == payloads.Cap()-1 {
-		// end of vector
-		vectorMap := map[string]interface{}{}
+		// Construct a map with all vector elements assigned to their keys
+		vectorMap := make(map[string]interface{}, payloads.Cap())
 		for k, v := range Vector {
-			// construct a map[variable]=value with all available vectors
 			vectorMap[payloads.KeyAtNth(k)] = v
 		}
-		// one element a.k.a last element is missing from ^ map
+
+		// Fill in the final missing element and invoke callback
 		index := len(Vector)
 		for _, elem := range payloads.GetNth(index) {
 			vectorMap[payloads.KeyAtNth(index)] = elem
-			callback(vectorMap)
+			if !callback(vectorMap) {
+				return false // Early termination requested
+			}
 		}
-		return
+		return true
 	}
 
-	// step 5) if vector is not filled until payload.Cap()-1
-	// iterate over rth variable payloads and execute them using recursion
-	// if Vector is empty or at 1st index fix iterate over xth position
+	// Recursive case: Build up the vector by iterating through payloads at current index
 	index := len(Vector)
 	for _, v := range payloads.GetNth(index) {
-		var tmp []string
-		if len(Vector) > 0 {
-			tmp = append(tmp, Vector...)
-		}
+		// Pre-allocate capacity to reduce allocations
+		tmp := make([]string, len(Vector), len(Vector)+1)
+		copy(tmp, Vector)
 		tmp = append(tmp, v)
-		ClusterBomb(payloads, callback, tmp) // Recursion
+
+		if !ClusterBomb(payloads, callback, tmp) {
+			return false // Propagate early termination
+		}
 	}
+	return true
 }
 
+// IndexMap provides indexed access to a map, allowing retrieval by numeric position.
+// This is useful when you need deterministic iteration order over map keys.
 type IndexMap struct {
 	values  map[string][]string
 	indexes map[int]string
 }
 
+// GetNth returns the slice of values at the nth position in the map
 func (o *IndexMap) GetNth(n int) []string {
 	return o.values[o.indexes[n]]
 }
 
+// Cap returns the number of keys in the IndexMap
 func (o *IndexMap) Cap() int {
 	return len(o.values)
 }
 
-// KeyAtNth returns key present at Nth position
+// KeyAtNth returns the key present at the nth position
 func (o *IndexMap) KeyAtNth(n int) string {
 	return o.indexes[n]
 }
 
-// NewIndexMap returns type such that elements of map can be retrieved by a fixed index
+// NewIndexMap creates an IndexMap that allows elements to be retrieved by a fixed numeric index.
+// This provides deterministic ordering for map iteration, which is useful for reproducible results.
 func NewIndexMap(values map[string][]string) *IndexMap {
 	i := &IndexMap{
-		values: values,
+		values:  values,
+		indexes: make(map[int]string, len(values)),
 	}
-	indexes := map[int]string{}
 	counter := 0
 	for k := range values {
-		indexes[counter] = k
+		i.indexes[counter] = k
 		counter++
 	}
-	i.indexes = indexes
 	return i
 }

@@ -20,26 +20,27 @@ var (
 	extractNumbers   = regexp.MustCompile(`[0-9]+`)
 	extractWords     = regexp.MustCompile(`[a-zA-Z0-9]+`)
 	extractWordsOnly = regexp.MustCompile(`[a-zA-Z]{3,}`)
-	DedupeResults    = true // Dedupe all results (default: true)
 )
 
-// Mutator Options
+// Options contains configuration for the Mutator
 type Options struct {
-	// list of Domains to use as base
+	// Domains is the list of domains to use as base for permutations
 	Domains []string
-	// list of words to use while creating permutations
-	// if empty DefaultWordList is used
+	// Payloads contains words to use while creating permutations
+	// If empty, DefaultWordList is used
 	Payloads map[string][]string
-	// list of pattersn to use while creating permutations
-	// if empty DefaultPatterns are used
+	// Patterns is the list of patterns to use while creating permutations
+	// If empty, DefaultPatterns are used
 	Patterns []string
-	// Limits output results (0 = no limit)
+	// Limit restricts output results (0 = no limit)
 	Limit int
-	// Enrich when true alterx extra possible words from input
+	// Enrich when true, alterx extracts possible words from input
 	// and adds them to default payloads word,number
 	Enrich bool
-	// MaxSize limits output data size
+	// MaxSize limits output data size in bytes
 	MaxSize int
+	// DedupeResults when true, deduplicates all results (default: true)
+	DedupeResults bool
 }
 
 // Mutator
@@ -55,18 +56,24 @@ type Mutator struct {
 // New creates and returns new mutator instance from options
 func New(opts *Options) (*Mutator, error) {
 	if len(opts.Domains) == 0 {
-		return nil, fmt.Errorf("no input provided to calculate permutations")
+		return nil, fmt.Errorf("no domains provided: please provide at least one domain via -l flag or stdin")
 	}
+
+	// Set default for DedupeResults if not explicitly set
+	if !opts.DedupeResults {
+		opts.DedupeResults = true // Default to true
+	}
+
 	if len(opts.Payloads) == 0 {
 		opts.Payloads = map[string][]string{}
 		if len(DefaultConfig.Payloads) == 0 {
-			return nil, fmt.Errorf("something went wrong, `DefaultWordList` and input wordlist are empty")
+			return nil, fmt.Errorf("no payloads available: default payload configuration is empty and no custom payloads provided")
 		}
 		opts.Payloads = DefaultConfig.Payloads
 	}
 	if len(opts.Patterns) == 0 {
 		if len(DefaultConfig.Patterns) == 0 {
-			return nil, fmt.Errorf("something went wrong,`DefaultPatters` and input patterns are empty")
+			return nil, fmt.Errorf("no patterns available: default pattern configuration is empty and no custom patterns provided")
 		}
 		opts.Patterns = DefaultConfig.Patterns
 	}
@@ -74,7 +81,7 @@ func New(opts *Options) (*Mutator, error) {
 	for k, v := range opts.Payloads {
 		dedupe := sliceutil.Dedupe(v)
 		if len(v) != len(dedupe) {
-			gologger.Warning().Msgf("%v duplicate payloads found in %v. purging them..", len(v)-len(dedupe), k)
+			gologger.Warning().Msgf("found %d duplicate payloads in '%s', removing duplicates", len(v)-len(dedupe), k)
 			opts.Payloads[k] = dedupe
 		}
 	}
@@ -82,7 +89,7 @@ func New(opts *Options) (*Mutator, error) {
 		Options: opts,
 	}
 	if err := m.validatePatterns(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("pattern validation failed: %w", err)
 	}
 	if err := m.prepareInputs(); err != nil {
 		return nil, err
@@ -94,38 +101,51 @@ func New(opts *Options) (*Mutator, error) {
 }
 
 // Execute calculates all permutations using input wordlist and patterns
-// and writes them to a string channel
+// and writes them to a string channel. The context can be used to cancel
+// the operation. Results are returned via a read-only channel.
 func (m *Mutator) Execute(ctx context.Context) <-chan string {
 	var maxBytes int
-	if DedupeResults {
+	if m.Options.DedupeResults {
 		count := m.EstimateCount()
 		maxBytes = count * m.maxkeyLenInBytes
 	}
 
 	results := make(chan string, len(m.Options.Patterns))
 	go func() {
+		defer close(results)
 		now := time.Now()
+
 		for _, v := range m.Inputs {
+			// Check for cancellation at the input level
+			select {
+			case <-ctx.Done():
+				m.timeTaken = time.Since(now)
+				return
+			default:
+			}
+
 			varMap := getSampleMap(v.GetMap(), m.Options.Payloads)
 			for _, pattern := range m.Options.Patterns {
+				// Check for cancellation at the pattern level
+				select {
+				case <-ctx.Done():
+					m.timeTaken = time.Since(now)
+					return
+				default:
+				}
+
 				if err := checkMissing(pattern, varMap); err == nil {
 					statement := Replace(pattern, v.GetMap())
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						m.clusterBomb(statement, results)
-					}
+					m.clusterBomb(ctx, statement, results)
 				} else {
-					gologger.Warning().Msgf("%v : failed to evaluate pattern %v. skipping", err.Error(), pattern)
+					gologger.Warning().Msgf("pattern '%s' has missing variables: %v, skipping", pattern, err)
 				}
 			}
 		}
 		m.timeTaken = time.Since(now)
-		close(results)
 	}()
 
-	if DedupeResults {
+	if m.Options.DedupeResults {
 		// drain results
 		d := dedupe.NewDedupe(results, maxBytes)
 		d.Drain()
@@ -134,47 +154,71 @@ func (m *Mutator) Execute(ctx context.Context) <-chan string {
 	return results
 }
 
-// ExecuteWithWriter executes Mutator and writes results directly to type that implements io.Writer interface
-func (m *Mutator) ExecuteWithWriter(Writer io.Writer) error {
-	if Writer == nil {
+// ExecuteWithWriter executes Mutator and writes results directly to a type that implements io.Writer interface.
+// The context can be used to cancel the operation.
+func (m *Mutator) ExecuteWithWriter(ctx context.Context, writer io.Writer) error {
+	if writer == nil {
 		return errorutil.NewWithTag("alterx", "writer destination cannot be nil")
 	}
-	resChan := m.Execute(context.TODO())
-	m.payloadCount = 0
-	maxFileSize := m.Options.MaxSize
-	for {
-		value, ok := <-resChan
-		if !ok {
-			gologger.Info().Msgf("Generated %v permutations in %v", m.payloadCount, m.Time())
-			return nil
-		}
-		if m.Options.Limit > 0 && m.payloadCount == m.Options.Limit {
-			// we can't early exit, due to abstraction we have to conclude the elaboration to drain all dedupers
-			continue
-		}
-		if maxFileSize <= 0 {
-			// drain all dedupers when max-file size reached
-			continue
-		}
-
-		if strings.HasPrefix(value, "-") {
-			continue
-		}
-
-		outputData := []byte(value + "\n")
-		if len(outputData) > maxFileSize {
-			maxFileSize = 0
-			continue
-		}
-
-		n, err := Writer.Write(outputData)
-		if err != nil {
-			return err
-		}
-		// update maxFileSize limit after each write
-		maxFileSize -= n
-		m.payloadCount++
+	if ctx == nil {
+		ctx = context.Background()
 	}
+
+	resChan := m.Execute(ctx)
+	m.payloadCount = 0
+	remainingSize := m.Options.MaxSize
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case value, ok := <-resChan:
+			if !ok {
+				gologger.Info().Msgf("Generated %d permutations in %s", m.payloadCount, m.Time())
+				return nil
+			}
+
+			// Skip if limit reached
+			if m.Options.Limit > 0 && m.payloadCount >= m.Options.Limit {
+				continue
+			}
+
+			// Skip if max size reached
+			if m.Options.MaxSize > 0 && remainingSize <= 0 {
+				continue
+			}
+
+			// Skip domains starting with hyphen (invalid)
+			if strings.HasPrefix(value, "-") {
+				continue
+			}
+
+			outputData := []byte(value + "\n")
+
+			// Check if writing this would exceed size limit
+			if m.Options.MaxSize > 0 && len(outputData) > remainingSize {
+				remainingSize = 0
+				continue
+			}
+
+			n, err := writer.Write(outputData)
+			if err != nil {
+				return fmt.Errorf("failed to write output: %w", err)
+			}
+
+			// Update remaining size limit after each write
+			if m.Options.MaxSize > 0 {
+				remainingSize -= n
+			}
+			m.payloadCount++
+		}
+	}
+}
+
+// ExecuteWithWriterLegacy is the legacy version of ExecuteWithWriter that uses context.Background()
+// Deprecated: Use ExecuteWithWriter with explicit context instead
+func (m *Mutator) ExecuteWithWriterLegacy(writer io.Writer) error {
+	return m.ExecuteWithWriter(context.Background(), writer)
 }
 
 // EstimateCount estimates number of payloads that will be created
@@ -214,33 +258,37 @@ func (m *Mutator) EstimateCount() int {
 // this value is also stored in variable and can be accessed via getter `PayloadCount`
 func (m *Mutator) DryRun() int {
 	m.payloadCount = 0
-	err := m.ExecuteWithWriter(io.Discard)
+	err := m.ExecuteWithWriter(context.Background(), io.Discard)
 	if err != nil {
-		gologger.Error().Msgf("alterx: got %v", err)
+		gologger.Error().Msgf("alterx dry run failed: %v", err)
 	}
 	return m.payloadCount
 }
 
 // clusterBomb calculates all payloads of clusterbomb attack and sends them to result channel
-func (m *Mutator) clusterBomb(template string, results chan string) {
+// It respects context cancellation to allow early termination
+func (m *Mutator) clusterBomb(ctx context.Context, template string, results chan string) {
 	// Early Exit: this is what saves clusterBomb from stackoverflows and reduces
 	// n*len(n) iterations and n recursions
 	varsUsed := getAllVars(template)
 	if len(varsUsed) == 0 {
 		// clusterBomb is not required
 		// just send existing template as result and exit
-		results <- template
+		select {
+		case results <- template:
+		case <-ctx.Done():
+		}
 		return
 	}
 	payloadSet := map[string][]string{}
 	// instead of sending all payloads only send payloads that are used
 	// in template/statement
-	leftmostSub := strings.Split(template, ".")[0]
+	leftmostPart, _, _ := strings.Cut(template, ".")
 	for _, v := range varsUsed {
 		payloadSet[v] = []string{}
 		for _, word := range m.Options.Payloads[v] {
-			if !strings.HasPrefix(leftmostSub, word) && !strings.HasSuffix(leftmostSub, word) {
-				// skip all words that are already present in leftmost sub , it is highly unlikely
+			if !strings.HasPrefix(leftmostPart, word) && !strings.HasSuffix(leftmostPart, word) {
+				// skip all words that are already present in leftmost part, it is highly unlikely
 				// we will ever find api-api.example.com
 				payloadSet[v] = append(payloadSet[v], word)
 			}
@@ -249,29 +297,46 @@ func (m *Mutator) clusterBomb(template string, results chan string) {
 	payloads := NewIndexMap(payloadSet)
 	// in clusterBomb attack no of payloads generated are
 	// len(first_set)*len(second_set)*len(third_set)....
-	callbackFunc := func(varMap map[string]interface{}) {
-		results <- Replace(template, varMap)
+	callbackFunc := func(varMap map[string]interface{}) bool {
+		select {
+		case results <- Replace(template, varMap):
+			return true
+		case <-ctx.Done():
+			return false
+		}
 	}
 	ClusterBomb(payloads, callbackFunc, []string{})
 }
 
-// prepares input and patterns and calculates estimations
+// prepareInputs processes and validates all input domains
 func (m *Mutator) prepareInputs() error {
 	var errors []string
-	// prepare input
 	var allInputs []*Input
-	for _, v := range m.Options.Domains {
-		i, err := NewInput(v)
+
+	for _, domain := range m.Options.Domains {
+		input, err := NewInput(domain)
 		if err != nil {
-			errors = append(errors, err.Error())
+			errors = append(errors, fmt.Sprintf("%s: %v", domain, err))
 			continue
 		}
-		allInputs = append(allInputs, i)
+		allInputs = append(allInputs, input)
 	}
+
 	m.Inputs = allInputs
-	if len(errors) > 0 {
-		gologger.Warning().Msgf("errors found when preparing inputs got: %v : skipping errored inputs", strings.Join(errors, " : "))
+
+	// If ALL inputs failed, return error
+	if len(allInputs) == 0 {
+		if len(errors) > 0 {
+			return fmt.Errorf("all %d input domains failed to parse: %s", len(m.Options.Domains), strings.Join(errors, "; "))
+		}
+		return fmt.Errorf("no valid inputs were processed from %d provided domains", len(m.Options.Domains))
 	}
+
+	// If some inputs failed, log warnings
+	if len(errors) > 0 {
+		gologger.Warning().Msgf("failed to parse %d/%d domains: %s", len(errors), len(m.Options.Domains), strings.Join(errors, "; "))
+	}
+
 	return nil
 }
 
